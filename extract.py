@@ -45,6 +45,9 @@ SHAPE_KEYS: Dict[str, List[str]] = {
     "rmsnorm":           ["M", "N"],
     "reduce":            ["M", "N"],
     "rotary_embedding":  ["B", "H", "N", "D"],
+    "conv1d":            ["batch", "in_channels", "length", "out_channels", "kernel_size", "stride"],
+    "conv_transpose1d":  ["batch", "in_channels", "length", "out_channels", "kernel_size", "stride"],
+    "snake_activation":  ["batch", "channels", "length"],
 }
 
 # Aliases: profile_report.json may use different key names than bench.py
@@ -78,6 +81,22 @@ SHAPE_ALIAS_MAP: Dict[str, Dict[str, str]] = {
     "rotary_embedding": {
         "B": "batch", "H": "heads", "N": "seq_len", "S": "seq_len", "D": "head_dim",
         "batch": "batch", "heads": "heads", "seq_len": "seq_len", "head_dim": "head_dim",
+    },
+    "conv1d": {
+        "batch": "batch", "in_channels": "in_channels", "length": "length",
+        "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride",
+        "B": "batch", "C_in": "in_channels", "L": "length", "C_out": "out_channels",
+        "K": "kernel_size", "S": "stride",
+    },
+    "conv_transpose1d": {
+        "batch": "batch", "in_channels": "in_channels", "length": "length",
+        "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride",
+        "B": "batch", "C_in": "in_channels", "L": "length", "C_out": "out_channels",
+        "K": "kernel_size", "S": "stride",
+    },
+    "snake_activation": {
+        "batch": "batch", "channels": "channels", "length": "length",
+        "B": "batch", "C": "channels", "L": "length",
     },
 }
 
@@ -126,6 +145,21 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
         "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
         "float32":  {"atol": 1e-5, "rtol": 1e-5},
     },
+    "conv1d": {
+        "float16":  {"atol": 1e-2, "rtol": 1e-2},
+        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
+        "float32":  {"atol": 1e-4, "rtol": 1e-4},
+    },
+    "conv_transpose1d": {
+        "float16":  {"atol": 1e-2, "rtol": 1e-2},
+        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
+        "float32":  {"atol": 1e-4, "rtol": 1e-4},
+    },
+    "snake_activation": {
+        "float16":  {"atol": 1e-3, "rtol": 1e-3},
+        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
+        "float32":  {"atol": 1e-5, "rtol": 1e-5},
+    },
 }
 
 # FLOPS formulas as source strings, per op_type
@@ -139,6 +173,9 @@ FLOPS_FN_SRC: Dict[str, str] = {
     "rmsnorm":          'return 6 * s["M"] * s["N"]',
     "reduce":           'return s["M"] * s["N"]',
     "rotary_embedding": 'return 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"]',
+    "conv1d":           'return 2 * s["batch"] * s["out_channels"] * s["length"] * s["in_channels"] * s["kernel_size"] // s["stride"]',
+    "conv_transpose1d": 'return 2 * s["batch"] * s["in_channels"] * s["length"] * s["out_channels"] * s["kernel_size"]',
+    "snake_activation": 'return 6 * s["batch"] * s["channels"] * s["length"]',
 }
 
 # BYTES formulas as source strings, per op_type (dt_bytes is passed in)
@@ -152,6 +189,9 @@ BYTES_FN_SRC: Dict[str, str] = {
     "rmsnorm":          'return (2 * s["M"] * s["N"] + s["N"]) * dt_bytes',
     "reduce":           'return (s["M"] * s["N"] + s["M"]) * dt_bytes',
     "rotary_embedding": 'return (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 + s["seq_len"] * s["head_dim"]) * dt_bytes',
+    "conv1d":           'return (s["batch"] * s["in_channels"] * s["length"] + s["out_channels"] * s["in_channels"] * s["kernel_size"] + s["batch"] * s["out_channels"] * s["length"] // s["stride"]) * dt_bytes',
+    "conv_transpose1d": 'return (s["batch"] * s["in_channels"] * s["length"] + s["in_channels"] * s["out_channels"] * s["kernel_size"] + s["batch"] * s["out_channels"] * s["length"] * s["stride"]) * dt_bytes',
+    "snake_activation": 'return (2 * s["batch"] * s["channels"] * s["length"] + s["channels"]) * dt_bytes',
 }
 
 # Speedup potential heuristic per op_type
@@ -165,6 +205,9 @@ SPEEDUP_ESTIMATES: Dict[str, str] = {
     "rmsnorm":          "1.5-3x",
     "reduce":           "1.5-2x",
     "rotary_embedding": "1.5-2x",
+    "conv1d":           "2-3x",
+    "conv_transpose1d": "2-3x",
+    "snake_activation": "2-4x",
 }
 
 
@@ -234,6 +277,9 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
         "rmsnorm":          {"M": 4096, "N": 4096},
         "reduce":           {"M": 4096, "N": 4096},
         "rotary_embedding": {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128},
+        "conv1d":            {"batch": 1, "in_channels": 256, "length": 2048, "out_channels": 512, "kernel_size": 7, "stride": 1},
+        "conv_transpose1d":  {"batch": 1, "in_channels": 512, "length": 256, "out_channels": 256, "kernel_size": 16, "stride": 8},
+        "snake_activation":  {"batch": 1, "channels": 512, "length": 1024},
     }
     return defaults.get(op_type, {"M": 2048, "N": 2048})
 
@@ -394,7 +440,7 @@ def get_supported_kernels(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     Extract the list of supported (autokernel_supported=True) kernels from
     the profile report, sorted by rank.
     """
-    kernels = report.get("kernels", report.get("bottleneck_kernels", []))
+    kernels = report.get("kernels", report.get("top_kernels", report.get("bottleneck_kernels", [])))
     supported = []
     for k in kernels:
         if k.get("autokernel_supported", False):

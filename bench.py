@@ -126,7 +126,7 @@ def detect_gpu() -> GPUSpec:
     props = torch.cuda.get_device_properties(0)
     name = props.name
     sm_count = props.multi_processor_count
-    memory_gb = round(props.total_mem / (1024 ** 3), 1)
+    memory_gb = round(props.total_memory / (1024 ** 3), 1)
     cc = (props.major, props.minor)
 
     # Try to match a known GPU
@@ -249,6 +249,48 @@ def gen_reduce_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 4
     return {"x": x}
 
 
+def gen_conv1d_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    B = size["batch"]
+    C_in = size["in_channels"]
+    L = size["length"]
+    C_out = size["out_channels"]
+    K = size["kernel_size"]
+    stride = size["stride"]
+    padding = (K - 1) // 2  # symmetric padding
+    x = torch.randn(B, C_in, L, device=device, dtype=dtype)
+    weight = torch.randn(C_out, C_in, K, device=device, dtype=dtype) * 0.02
+    bias = torch.randn(C_out, device=device, dtype=dtype) * 0.01
+    return {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding}
+
+
+def gen_conv_transpose1d_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    B = size["batch"]
+    C_in = size["in_channels"]
+    L = size["length"]
+    C_out = size["out_channels"]
+    K = size["kernel_size"]
+    stride = size["stride"]
+    padding = (K - stride) // 2
+    output_padding = 1 if (K - stride) % 2 != 0 else 0
+    x = torch.randn(B, C_in, L, device=device, dtype=dtype)
+    weight = torch.randn(C_in, C_out, K, device=device, dtype=dtype) * 0.02
+    bias = torch.randn(C_out, device=device, dtype=dtype) * 0.01
+    return {"x": x, "weight": weight, "bias": bias, "stride": stride, "padding": padding,
+            "output_padding": output_padding}
+
+
+def gen_snake_activation_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    B = size["batch"]
+    C = size["channels"]
+    L = size["length"]
+    x = torch.randn(B, C, L, device=device, dtype=dtype)
+    alpha = torch.ones(1, C, 1, device=device, dtype=dtype)
+    return {"x": x, "alpha": alpha}
+
+
 # =========================================================================
 # 3. REFERENCE WRAPPERS
 # =========================================================================
@@ -289,6 +331,21 @@ def _ref_rmsnorm(inputs: dict) -> torch.Tensor:
 def _ref_reduce(inputs: dict) -> torch.Tensor:
     import reference
     return reference.reduce_sum_ref(inputs["x"], dim=-1)
+
+def _ref_conv1d(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.conv1d_ref(inputs["x"], inputs["weight"], inputs["bias"],
+                                inputs["stride"], inputs["padding"])
+
+def _ref_conv_transpose1d(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.conv_transpose1d_ref(inputs["x"], inputs["weight"], inputs["bias"],
+                                          inputs["stride"], inputs["padding"],
+                                          inputs["output_padding"])
+
+def _ref_snake_activation(inputs: dict) -> torch.Tensor:
+    import reference
+    return reference.snake_activation_ref(inputs["x"], inputs["alpha"])
 
 
 # =========================================================================
@@ -565,6 +622,118 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "edge_sizes": [
             ("edge_1023", {"M": 1023, "N": 1024}),
             ("edge_4097", {"M": 4096, "N": 4097}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # CONV1D (1D convolution -- DAC-VAE encoder / residual units)
+    # -----------------------------------------------------------------
+    "conv1d": {
+        "test_sizes": [
+            # DAC-VAE encoder shapes
+            ("tiny",      {"batch": 1, "in_channels": 1,   "length": 4096,  "out_channels": 64,  "kernel_size": 7, "stride": 1}),
+            ("small",     {"batch": 1, "in_channels": 64,  "length": 4096,  "out_channels": 128, "kernel_size": 4, "stride": 2}),
+            ("medium",    {"batch": 1, "in_channels": 128, "length": 2048,  "out_channels": 256, "kernel_size": 8, "stride": 4}),
+            ("large",     {"batch": 1, "in_channels": 256, "length": 512,   "out_channels": 512, "kernel_size": 16, "stride": 8}),
+            ("xlarge",    {"batch": 1, "in_channels": 512, "length": 64,    "out_channels": 1024, "kernel_size": 16, "stride": 8}),
+            # Residual unit convs (stride=1)
+            ("res_small", {"batch": 1, "in_channels": 64,  "length": 8192,  "out_channels": 64,  "kernel_size": 7, "stride": 1}),
+            ("res_large", {"batch": 1, "in_channels": 512, "length": 128,   "out_channels": 512, "kernel_size": 7, "stride": 1}),
+            # 1x1 convolution (projection)
+            ("proj",      {"batch": 1, "in_channels": 1024, "length": 86,   "out_channels": 128, "kernel_size": 1, "stride": 1}),
+        ],
+        "test_dtypes": [torch.float32, torch.float16],
+        "tolerances": {
+            # Relaxed fp32 tolerance: accumulation order differs between Triton and cuDNN
+            torch.float32:  {"atol": 5e-3, "rtol": 5e-3},
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
+        },
+        # FLOPs: 2 * B * C_out * L_out * C_in * K
+        "flops_fn": lambda s: 2 * s["batch"] * s["out_channels"] * \
+            ((s["length"] + 2 * ((s["kernel_size"] - 1) // 2) - s["kernel_size"]) // s["stride"] + 1) * \
+            s["in_channels"] * s["kernel_size"],
+        "bytes_fn": lambda s, dt: (s["batch"] * s["in_channels"] * s["length"] +
+                                    s["out_channels"] * s["in_channels"] * s["kernel_size"] +
+                                    s["out_channels"] +
+                                    s["batch"] * s["out_channels"] *
+                                    ((s["length"] + 2 * ((s["kernel_size"] - 1) // 2) - s["kernel_size"]) // s["stride"] + 1)
+                                   ) * _dtype_bytes(dt),
+        "input_generator": gen_conv1d_inputs,
+        "reference_fn": _ref_conv1d,
+        "edge_sizes": [
+            ("edge_odd_k", {"batch": 1, "in_channels": 64, "length": 1000, "out_channels": 128, "kernel_size": 5, "stride": 1}),
+            ("edge_s3",    {"batch": 1, "in_channels": 64, "length": 999,  "out_channels": 128, "kernel_size": 6, "stride": 3}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # CONV_TRANSPOSE1D (1D transposed convolution -- DAC-VAE decoder)
+    # -----------------------------------------------------------------
+    "conv_transpose1d": {
+        "test_sizes": [
+            # DAC-VAE decoder shapes (upsample)
+            ("tiny",     {"batch": 1, "in_channels": 1024, "length": 8,    "out_channels": 768,  "kernel_size": 16, "stride": 8}),
+            ("small",    {"batch": 1, "in_channels": 768,  "length": 64,   "out_channels": 384,  "kernel_size": 16, "stride": 8}),
+            ("medium",   {"batch": 1, "in_channels": 384,  "length": 512,  "out_channels": 192,  "kernel_size": 8, "stride": 4}),
+            ("large",    {"batch": 1, "in_channels": 192,  "length": 2048, "out_channels": 96,   "kernel_size": 4, "stride": 2}),
+            # Full decoder chain shapes
+            ("dac_dec1", {"batch": 1, "in_channels": 1536, "length": 86,   "out_channels": 768,  "kernel_size": 16, "stride": 8}),
+            ("dac_dec4", {"batch": 1, "in_channels": 192,  "length": 22050, "out_channels": 96,  "kernel_size": 4, "stride": 2}),
+        ],
+        "test_dtypes": [torch.float32, torch.float16],
+        "tolerances": {
+            # Relaxed fp32 tolerance: accumulation order differs between Triton and cuDNN
+            torch.float32:  {"atol": 5e-3, "rtol": 5e-3},
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
+        },
+        # FLOPs: 2 * B * C_in * L_in * C_out * K
+        "flops_fn": lambda s: 2 * s["batch"] * s["in_channels"] * s["length"] * s["out_channels"] * s["kernel_size"],
+        "bytes_fn": lambda s, dt: (s["batch"] * s["in_channels"] * s["length"] +
+                                    s["in_channels"] * s["out_channels"] * s["kernel_size"] +
+                                    s["out_channels"] +
+                                    s["batch"] * s["out_channels"] *
+                                    ((s["length"] - 1) * s["stride"] + s["kernel_size"])
+                                   ) * _dtype_bytes(dt),
+        "input_generator": gen_conv_transpose1d_inputs,
+        "reference_fn": _ref_conv_transpose1d,
+        "edge_sizes": [
+            ("edge_odd", {"batch": 1, "in_channels": 256, "length": 63,  "out_channels": 128, "kernel_size": 8, "stride": 4}),
+            ("edge_s3",  {"batch": 1, "in_channels": 128, "length": 100, "out_channels": 64,  "kernel_size": 6, "stride": 3}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # SNAKE ACTIVATION (learnable periodic activation -- DAC-VAE)
+    # -----------------------------------------------------------------
+    "snake_activation": {
+        "test_sizes": [
+            ("tiny",    {"batch": 1, "channels": 64,   "length": 1024}),
+            ("small",   {"batch": 1, "channels": 128,  "length": 4096}),
+            ("medium",  {"batch": 1, "channels": 256,  "length": 2048}),
+            ("large",   {"batch": 1, "channels": 512,  "length": 1024}),
+            ("xlarge",  {"batch": 1, "channels": 1024, "length": 512}),
+            # Full-length DAC-VAE shapes
+            ("dac_enc", {"batch": 1, "channels": 64,   "length": 44100}),
+            ("dac_mid", {"batch": 1, "channels": 512,  "length": 172}),
+            ("dac_dec", {"batch": 1, "channels": 96,   "length": 44100}),
+        ],
+        "test_dtypes": [torch.float32, torch.float16],
+        "tolerances": {
+            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
+            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
+            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
+        },
+        # FLOPs: ~6 ops per element (mul, sin, pow, mul, reciprocal, add)
+        "flops_fn": lambda s: 6 * s["batch"] * s["channels"] * s["length"],
+        # Bytes: read input + alpha, write output
+        "bytes_fn": lambda s, dt: (2 * s["batch"] * s["channels"] * s["length"] + s["channels"]) * _dtype_bytes(dt),
+        "input_generator": gen_snake_activation_inputs,
+        "reference_fn": _ref_snake_activation,
+        "edge_sizes": [
+            ("edge_1023", {"batch": 1, "channels": 63,  "length": 1023}),
+            ("edge_4097", {"batch": 1, "channels": 127, "length": 4097}),
         ],
     },
 }

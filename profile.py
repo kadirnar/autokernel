@@ -42,6 +42,9 @@ WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worksp
 _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["flash", "fmha"],                       "flash_attention"),
     (["attention"],                            "flash_attention"),
+    (["snake"],                                "snake_activation"),
+    (["conv_transpose", "convtranspose", "deconv"],  "conv_transpose1d"),
+    (["conv1d", "conv_1d"],                    "conv1d"),
     (["gemm", "matmul", "cublas"],             "matmul"),
     (["softmax"],                              "softmax"),
     (["layer_norm", "layernorm"],              "layernorm"),
@@ -92,7 +95,7 @@ def _fallback_detect_gpu() -> GPUSpec:
     props = torch.cuda.get_device_properties(0)
     name = props.name
     sm_count = props.multi_processor_count
-    memory_gb = round(props.total_mem / (1024 ** 3), 1)
+    memory_gb = round(props.total_memory / (1024 ** 3), 1)
     cc = (props.major, props.minor)
 
     # Known GPUs: name_fragment -> (peak_fp16_tflops, peak_bandwidth_gb_s, l2_cache_mb)
@@ -286,8 +289,36 @@ def load_model(args: argparse.Namespace) -> Tuple[nn.Module, str]:
 # Input generation
 # ---------------------------------------------------------------------------
 
+def _is_audio_model(model: nn.Module) -> bool:
+    """Heuristic: does the model expect audio waveform input [B, 1, T]?"""
+    cls_name = type(model).__name__.lower()
+    audio_indicators = [
+        "dac", "vae", "codec", "vocoder", "wavenet", "wavernn",
+        "hifi", "encodec", "soundstream", "audio",
+    ]
+    if any(ind in cls_name for ind in audio_indicators):
+        return True
+
+    # Check for encoder/decoder pattern with Conv1d as first layer
+    for name, child in model.named_children():
+        child_name = type(child).__name__.lower()
+        if "encoder" in name.lower() or "encoder" in child_name:
+            # Check if encoder starts with Conv1d
+            for subname, subchild in child.named_children():
+                if isinstance(subchild, (nn.Conv1d, nn.Sequential)):
+                    return True
+                break
+        break
+
+    return False
+
+
 def _is_language_model(model: nn.Module) -> bool:
     """Heuristic: does the model expect input_ids (integer tokens)?"""
+    # Audio models are NOT language models
+    if _is_audio_model(model):
+        return False
+
     # Check common class names
     cls_name = type(model).__name__.lower()
     lm_indicators = [
@@ -316,11 +347,57 @@ def _is_language_model(model: nn.Module) -> bool:
     return False
 
 
+def _load_audio_file(audio_path: str, target_samples: int, sample_rate: int = 44100) -> torch.Tensor:
+    """Load audio from file and return as tensor [1, 1, T].
+
+    Tries soundfile first, falls back to ffmpeg subprocess.
+    """
+    audio_path = os.path.abspath(audio_path)
+    if not os.path.isfile(audio_path):
+        return None
+
+    # Try soundfile (WAV, FLAC, OGG)
+    try:
+        import soundfile as sf
+        # If MP3, convert to WAV first via ffmpeg
+        if audio_path.lower().endswith(".mp3"):
+            import subprocess, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-i", audio_path, "-ar", str(sample_rate),
+                     "-ac", "1", "-y", "-v", "quiet", tmp_path],
+                    check=True, timeout=30,
+                )
+                data, sr = sf.read(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+        else:
+            data, sr = sf.read(audio_path)
+
+        import numpy as np
+        wav = torch.from_numpy(data.astype(np.float32))
+        if wav.ndim == 2:
+            wav = wav.mean(dim=-1)  # stereo to mono
+        # Trim or pad to target_samples
+        if wav.shape[0] > target_samples:
+            wav = wav[:target_samples]
+        elif wav.shape[0] < target_samples:
+            wav = torch.nn.functional.pad(wav, (0, target_samples - wav.shape[0]))
+        return wav.unsqueeze(0).unsqueeze(0)  # [1, 1, T]
+    except Exception:
+        pass
+
+    return None
+
+
 def generate_input(
     model: nn.Module,
     input_shape: List[int],
     dtype: torch.dtype,
     device: str,
+    audio_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate appropriate sample input for the model."""
     if _is_language_model(model):
@@ -329,6 +406,18 @@ def generate_input(
         seq_len = input_shape[1] if len(input_shape) >= 2 else 512
         input_ids = torch.randint(0, 32000, (batch, seq_len), device=device, dtype=torch.long)
         return {"input_ids": input_ids}
+    elif _is_audio_model(model) and audio_path:
+        # Audio model: load real audio data
+        target_samples = input_shape[-1] if len(input_shape) >= 1 else 44100
+        wav = _load_audio_file(audio_path, target_samples)
+        if wav is not None:
+            x = wav.to(device=device, dtype=dtype)
+            print(f"  Loaded audio from {audio_path} ({target_samples} samples)")
+            return {"x": x}
+        else:
+            print(f"  WARNING: Could not load {audio_path}, using random input")
+            x = torch.randn(*input_shape, device=device, dtype=dtype)
+            return {"x": x}
     else:
         # Generic model: generate float tensor of given shape
         x = torch.randn(*input_shape, device=device, dtype=dtype)
@@ -357,6 +446,7 @@ def _prepare_model_and_input(
     input_shape: List[int],
     dtype: torch.dtype,
     device: str,
+    audio_path: Optional[str] = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Move model to device, generate input, validate forward pass.
     Handles OOM by trying smaller batch sizes."""
@@ -370,7 +460,7 @@ def _prepare_model_and_input(
 
     for attempt_batch in [original_batch, max(1, original_batch // 2), 1]:
         current_shape = [attempt_batch] + input_shape[1:]
-        inputs = generate_input(model, current_shape, dtype, device)
+        inputs = generate_input(model, current_shape, dtype, device, audio_path=audio_path)
 
         try:
             with torch.no_grad():
@@ -438,6 +528,11 @@ def classify_kernel(kernel_name: str) -> str:
         if re.search(r"(?:^|[^a-z])mm(?:$|[^a-z])", name_lower):
             return "matmul"
 
+    # Check for generic "conv" -- maps to conv1d for 1D models
+    # Must come after conv_transpose check above
+    if "conv" in name_lower and "transpose" not in name_lower:
+        return "conv1d"
+
     return "other"
 
 
@@ -457,9 +552,9 @@ def estimate_roofline_position(
     gpu: GPUSpec,
 ) -> str:
     """Rough heuristic: is this kernel compute-bound or memory-bound?"""
-    compute_bound_ops = {"matmul", "flash_attention"}
+    compute_bound_ops = {"matmul", "flash_attention", "conv1d", "conv_transpose1d"}
     memory_bound_ops = {"softmax", "layernorm", "rmsnorm", "reduce", "rotary_embedding",
-                        "fused_mlp", "cross_entropy"}
+                        "fused_mlp", "cross_entropy", "snake_activation"}
 
     if op_type in compute_bound_ops:
         return "compute-bound"
@@ -537,7 +632,7 @@ def profile_model(
     records: List[KernelRecord] = []
     for evt in key_averages:
         # We only care about events that ran on CUDA
-        cuda_time_us = evt.self_cuda_time_total
+        cuda_time_us = evt.self_device_time_total
         if cuda_time_us <= 0:
             continue
 
@@ -794,6 +889,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated input shape, e.g. '1,2048' or '8,3,224,224'.",
     )
     parser.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Path to audio file (MP3/WAV) for audio model profiling.",
+    )
+    parser.add_argument(
         "--dtype",
         type=str,
         default="float16",
@@ -892,7 +993,7 @@ def main() -> int:
     # Prepare model and input
     print("Preparing model and input...")
     try:
-        model, inputs = _prepare_model_and_input(model, input_shape, dtype, device)
+        model, inputs = _prepare_model_and_input(model, input_shape, dtype, device, audio_path=args.audio)
     except RuntimeError as e:
         print(f"ERROR: {e}")
         return 1
