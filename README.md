@@ -4,7 +4,7 @@
 
 ![AutoKernel Progress](progress.png)
 
-Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- which demonstrated autonomous AI agents for LLM training research. AutoKernel applies the same philosophy to GPU kernel optimization: agent modifies one file, runs a fixed evaluation, keeps or reverts, repeats forever.
+Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- which demonstrated autonomous AI agents for research. AutoKernel applies the same philosophy to GPU kernel optimization: agent modifies one file, runs a fixed evaluation, keeps or reverts, repeats forever.
 
 ## How It Works
 
@@ -35,9 +35,9 @@ uv sync
 # One-time setup: test data + baselines
 uv run prepare.py
 
-# Profile a model (ships with GPT-2, LLaMA, BERT -- no transformers needed)
-uv run profile.py --model models/llama_7b.py --class-name LlamaModel \
- --input-shape 1,512 --dtype float16
+# Profile the DAC-VAE model (ships with the repo -- no external dependencies)
+uv run profile.py --model models/dacvae.py --class-name DACVAE \
+ --input-shape 1,1,44100 --dtype float32 --audio vae_test.wav
 
 # Extract top bottleneck kernels
 uv run extract.py --top 5
@@ -56,7 +56,7 @@ Read program.md and let's kick off a new experiment. Start with setup.
 
 The agent will:
 1. Profile your model and present the optimization plan
-2. Create a branch (e.g., `autokernel/mar10-llama7b`)
+2. Create a branch (e.g., `autokernel/mar11-dacvae`)
 3. Optimize each bottleneck kernel in priority order
 4. Verify end-to-end correctness and report total speedup
 
@@ -66,7 +66,7 @@ The agent will:
 
 ```
                  profile.py              extract.py           bench.py (loop)         verify.py
-Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimize each  ──>  End-to-end
+Any PyTorch  -->  Rank kernels  -->  Generate baseline  -->  Optimize each  -->  End-to-end
    model          by GPU time       Triton kernels          kernel (agent)       verification
 ```
 
@@ -80,40 +80,26 @@ Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimiz
 
 ## Supported Kernels
 
-9 kernel types covering the core operations of modern deep learning:
+4 kernel types covering the core operations of the DAC-VAE audio codec:
 
 | Kernel | Description | Key Metric |
 |--------|-------------|------------|
-| **matmul** | Dense matrix multiplication (M x K) @ (K x N) | TFLOPS |
-| **softmax** | Row-parallel numerically stable softmax | GB/s |
-| **layernorm** | Layer normalization with affine transform | GB/s |
-| **rmsnorm** | RMS normalization (LLaMA-style) | GB/s |
-| **flash_attention** | Scaled dot-product attention with causal masking | TFLOPS |
-| **fused_mlp** | SwiGLU-style fused MLP (gate + up + down) | TFLOPS |
-| **cross_entropy** | Fused cross entropy loss | GB/s |
-| **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
-| **reduce** | Parallel reduction (sum) | GB/s |
+| **matmul** | Dense matrix multiplication (VAE bottleneck 1x1 projections) | TFLOPS |
+| **conv1d** | 1D convolution (encoder downsampling, residual units) | TFLOPS |
+| **conv_transpose1d** | 1D transposed convolution (decoder upsampling) | TFLOPS |
+| **snake_activation** | Snake activation: x + (1/alpha) * sin(alpha*x)^2 | GB/s |
 
 Each has a PyTorch reference in `reference.py` and a starter Triton kernel in `kernels/`.
 
-## Example Models
+## Example Model
 
-Self-contained model definitions ship with AutoKernel (no `transformers` library needed):
+Self-contained DAC-VAE model definition ships with AutoKernel (no external dependencies):
 
 | Model | File | Params | Usage |
 |-------|------|--------|-------|
-| GPT-2 Small | `models/gpt2.py` | 124M | `--class-name GPT2 --input-shape 1,1024` |
-| LLaMA (compact) | `models/llama_7b.py` | 160M | `--class-name LlamaModel --input-shape 1,512` |
-| LLaMA 7B | `models/llama_7b.py` | 7B | `--class-name LlamaModel7B --input-shape 1,2048` |
-| BERT-base | `models/bert_base.py` | 110M | `--class-name BertModel --input-shape 8,512` |
+| DAC-VAE (full) | `models/dacvae.py` | 76.6M | `--class-name DACVAE --input-shape 1,1,44100` |
+| DAC-VAE (small) | `models/dacvae.py` | 3.7M | `--class-name DACVAESmall --input-shape 1,1,44100` |
 | Custom | `models/custom.py` | -- | Template for your own model |
-
-For HuggingFace models (`uv sync --extra models`):
-
-```bash
-uv run profile.py --module transformers --class-name AutoModelForCausalLM \
- --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048 --dtype float16
-```
 
 ## Project Structure
 
@@ -132,18 +118,18 @@ autokernel/
   verify.py             end-to-end model verification + speedup report
   analysis.py           experiment visualization (generates progress.png)
 
-  kernels/              starter Triton kernels (9 types)
-  models/               self-contained model definitions (GPT-2, LLaMA, BERT)
+  kernels/              starter Triton kernels (4 types: conv1d, conv_transpose1d, snake_activation, matmul)
+  models/               self-contained model definitions (DAC-VAE)
   workspace/            runtime artifacts (gitignored)
 ```
 
 ## Design Choices
 
-**Why Triton.** Readable Python-like syntax the agent can understand and modify without mastering inline PTX or SASS. Well-tuned Triton regularly reaches 80-95% of cuBLAS. The agent needs to iterate fast -- Triton compiles in seconds, not minutes.
+**Why Triton.** Readable Python-like syntax the agent can understand and modify without mastering inline PTX or SASS. Well-tuned Triton regularly reaches 80-95% of cuBLAS/cuDNN. The agent needs to iterate fast -- Triton compiles in seconds, not minutes.
 
 **Correctness first.** The benchmark checks kernel output against PyTorch before measuring performance. A fast but wrong kernel is immediately reverted. This prevents the agent from "optimizing" by producing garbage.
 
-**Amdahl's law orchestration.** The orchestrator prioritizes by impact. A 1.5x speedup on a 60% kernel (1.25x end-to-end) beats a 3x speedup on a 5% kernel (1.03x end-to-end). It moves on when diminishing returns set in.
+**Amdahl's law orchestration.** The orchestrator prioritizes by impact. A 1.5x speedup on a 30% kernel (1.18x end-to-end) beats a 3x speedup on a 5% kernel (1.03x end-to-end). It moves on when diminishing returns set in.
 
 **Single file to modify.** The agent only touches `kernel.py`. Scope stays manageable, diffs reviewable, reverts clean.
 
@@ -157,18 +143,18 @@ Every experiment is logged to `results.tsv` (tab-separated):
 |--------|-------------|
 | `experiment` | Sequential experiment number (0 = baseline) |
 | `tag` | Short identifier |
-| `kernel_type` | Which kernel (e.g., `matmul`) |
+| `kernel_type` | Which kernel (e.g., `conv1d`) |
 | `throughput_tflops` | Measured throughput (higher is better) |
 | `latency_us` | Execution time in microseconds |
 | `pct_peak` | Percentage of GPU theoretical peak |
-| `speedup_vs_pytorch` | Speedup vs PyTorch/cuBLAS |
+| `speedup_vs_pytorch` | Speedup vs PyTorch/cuDNN |
 | `correctness` | PASS, FAIL, TIMEOUT, or CRASH |
 | `peak_vram_mb` | Peak GPU memory usage |
 | `description` | What was tried |
 
 ## Credits
 
-This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton.
+This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton.
 
 Built by the team behind [Forge](https://www.rightnowai.co/forge).
 

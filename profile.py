@@ -3,9 +3,8 @@
 AutoKernel Model Profiler -- Profile any PyTorch model to identify bottleneck kernels.
 
 Usage:
-    uv run profile.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,2048 --dtype float16
-    uv run profile.py --model models/gpt2.py --class-name GPT2 --input-shape 1,1024
-    uv run profile.py --module transformers --class-name AutoModelForCausalLM --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048
+    uv run profile.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --dtype float32 --audio vae_test.wav
+    uv run profile.py --model models/dacvae.py --class-name DACVAESmall --input-shape 1,1,88200 --dtype float32
 
 Output: profile_report.json in workspace/ directory
 """
@@ -40,19 +39,11 @@ WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worksp
 # Kernel classification rules: list of (pattern_fragments, op_type)
 # Checked in order; first match wins.
 _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
-    (["flash", "fmha"],                       "flash_attention"),
-    (["attention"],                            "flash_attention"),
     (["snake"],                                "snake_activation"),
     (["conv_transpose", "convtranspose", "deconv"],  "conv_transpose1d"),
     (["conv1d", "conv_1d"],                    "conv1d"),
     (["gemm", "matmul", "cublas"],             "matmul"),
-    (["softmax"],                              "softmax"),
-    (["layer_norm", "layernorm"],              "layernorm"),
-    (["rms_norm", "rmsnorm"],                  "rmsnorm"),
-    (["gelu", "silu", "mlp"],                  "fused_mlp"),
-    (["cross_entropy", "nll"],                 "cross_entropy"),
-    (["rotary", "rope"],                       "rotary_embedding"),
-    (["reduce", "all_reduce"],                 "reduce"),
+    (["conv"],                                 "conv1d"),
 ]
 
 # Op types that have a matching kernels/*.py file in AutoKernel.
@@ -66,7 +57,7 @@ def _discover_supported_op_types() -> set[str]:
     if os.path.isdir(kernels_dir):
         for fname in os.listdir(kernels_dir):
             if fname.endswith(".py") and fname != "__init__.py":
-                supported.add(fname[:-3])  # e.g. "matmul", "softmax"
+                supported.add(fname[:-3])  # e.g. "matmul", "conv1d"
     return supported
 
 
@@ -313,39 +304,6 @@ def _is_audio_model(model: nn.Module) -> bool:
     return False
 
 
-def _is_language_model(model: nn.Module) -> bool:
-    """Heuristic: does the model expect input_ids (integer tokens)?"""
-    # Audio models are NOT language models
-    if _is_audio_model(model):
-        return False
-
-    # Check common class names
-    cls_name = type(model).__name__.lower()
-    lm_indicators = [
-        "causal", "lm", "gpt", "llama", "bert", "t5", "opt", "falcon",
-        "mistral", "gemma", "phi", "qwen", "codegen", "bloom", "mpt",
-        "seq2seq",
-    ]
-    if any(ind in cls_name for ind in lm_indicators):
-        return True
-
-    # Check if model has an embedding layer as first child
-    for name, child in model.named_children():
-        child_name = type(child).__name__.lower()
-        if "embed" in name.lower() or "embedding" in child_name:
-            return True
-        break  # only check first child
-
-    # Check forward signature for 'input_ids'
-    try:
-        sig = inspect.signature(model.forward)
-        if "input_ids" in sig.parameters:
-            return True
-    except (ValueError, TypeError):
-        pass
-
-    return False
-
 
 def _load_audio_file(audio_path: str, target_samples: int, sample_rate: int = 44100) -> torch.Tensor:
     """Load audio from file and return as tensor [1, 1, T].
@@ -400,13 +358,7 @@ def generate_input(
     audio_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate appropriate sample input for the model."""
-    if _is_language_model(model):
-        # Language model: generate integer token IDs
-        batch = input_shape[0] if len(input_shape) >= 1 else 1
-        seq_len = input_shape[1] if len(input_shape) >= 2 else 512
-        input_ids = torch.randint(0, 32000, (batch, seq_len), device=device, dtype=torch.long)
-        return {"input_ids": input_ids}
-    elif _is_audio_model(model) and audio_path:
+    if _is_audio_model(model) and audio_path:
         # Audio model: load real audio data
         target_samples = input_shape[-1] if len(input_shape) >= 1 else 44100
         wav = _load_audio_file(audio_path, target_samples)
@@ -430,9 +382,7 @@ def _try_forward(
 ) -> bool:
     """Attempt a forward pass. Returns True on success."""
     try:
-        if "input_ids" in inputs:
-            model(input_ids=inputs["input_ids"])
-        elif "x" in inputs:
+        if "x" in inputs:
             model(inputs["x"])
         else:
             model(**inputs)
@@ -552,9 +502,8 @@ def estimate_roofline_position(
     gpu: GPUSpec,
 ) -> str:
     """Rough heuristic: is this kernel compute-bound or memory-bound?"""
-    compute_bound_ops = {"matmul", "flash_attention", "conv1d", "conv_transpose1d"}
-    memory_bound_ops = {"softmax", "layernorm", "rmsnorm", "reduce", "rotary_embedding",
-                        "fused_mlp", "cross_entropy", "snake_activation"}
+    compute_bound_ops = {"matmul", "conv1d", "conv_transpose1d"}
+    memory_bound_ops = {"snake_activation"}
 
     if op_type in compute_bound_ops:
         return "compute-bound"
@@ -586,9 +535,7 @@ class KernelRecord:
 
 def _run_forward(model: nn.Module, inputs: Dict[str, Any]) -> None:
     """Run a single forward pass with the correct calling convention."""
-    if "input_ids" in inputs:
-        model(input_ids=inputs["input_ids"])
-    elif "x" in inputs:
+    if "x" in inputs:
         try:
             model(inputs["x"])
         except TypeError:
@@ -845,13 +792,10 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  uv run profile.py --model models/llama_7b.py "
-            "--class-name LlamaModel --input-shape 1,2048 --dtype float16\n"
-            "  uv run profile.py --module transformers "
-            "--class-name AutoModelForCausalLM "
-            "--pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048\n"
-            "  uv run profile.py --model my_net.py "
-            "--class-name MyNet --input-shape 8,3,224,224 --dtype float32\n"
+            "  uv run profile.py --model models/dacvae.py "
+            "--class-name DACVAE --input-shape 1,1,44100 --dtype float32 --audio vae_test.wav\n"
+            "  uv run profile.py --model models/dacvae.py "
+            "--class-name DACVAESmall --input-shape 1,1,88200 --dtype float32\n"
         ),
     )
 

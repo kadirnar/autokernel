@@ -3,9 +3,9 @@
 AutoKernel End-to-End Verifier -- Plug optimized kernels back into the model and verify.
 
 Usage:
-    uv run verify.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,2048
-    uv run verify.py --module transformers --class-name AutoModelForCausalLM --pretrained meta-llama/Llama-2-7b-hf
-    uv run verify.py --model models/llama_7b.py --class-name LlamaModel --input-shape 1,2048 --diagnose
+    uv run verify.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --audio vae_test.wav
+    uv run verify.py --model models/dacvae.py --class-name DACVAESmall --input-shape 1,1,88200
+    uv run verify.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --diagnose
 
 Checks:
   1. Loads the original model
@@ -62,7 +62,7 @@ DEFAULT_TOLERANCES: Dict[torch.dtype, Dict[str, float]] = {
 @dataclass
 class KernelReplacement:
     """Describes a single kernel replacement: what to replace and with what."""
-    kernel_type: str          # e.g. "matmul", "layernorm", "rmsnorm"
+    kernel_type: str          # e.g. "matmul", "conv1d", "snake_activation"
     rank: int                 # priority rank from profiling
     speedup: float            # individual kernel speedup
     optimized_path: str       # path to optimized kernel .py file
@@ -420,75 +420,6 @@ class _LinearWrapper(nn.Module):
         return out
 
 
-class _LayerNormWrapper(nn.Module):
-    """Wraps nn.LayerNorm to use an optimized kernel_fn."""
-
-    def __init__(self, original: nn.LayerNorm, kernel_fn: Callable):
-        super().__init__()
-        self.original = original
-        self.kernel_fn = kernel_fn
-        self.weight = original.weight
-        self.bias = original.bias
-        self.eps = original.eps
-        self.normalized_shape = original.normalized_shape
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Reshape if needed: kernel_fn expects (x, weight, bias[, eps])
-        orig_shape = x.shape
-        if x.dim() > 2:
-            x_2d = x.reshape(-1, x.shape[-1])
-        else:
-            x_2d = x
-
-        try:
-            # Try full signature: kernel_fn(x, weight, bias, eps)
-            out = self.kernel_fn(x_2d, self.weight, self.bias, self.eps)
-        except TypeError:
-            try:
-                # Try without eps: kernel_fn(x, weight, bias)
-                out = self.kernel_fn(x_2d, self.weight, self.bias)
-            except TypeError:
-                # Fallback: just x
-                out = self.kernel_fn(x_2d)
-
-        if len(orig_shape) > 2:
-            out = out.reshape(orig_shape)
-
-        return out
-
-
-class _RMSNormWrapper(nn.Module):
-    """Wraps RMSNorm-like modules to use an optimized kernel_fn."""
-
-    def __init__(self, original: nn.Module, kernel_fn: Callable):
-        super().__init__()
-        self.original = original
-        self.kernel_fn = kernel_fn
-        # RMSNorm typically has a 'weight' attribute
-        self.weight = getattr(original, "weight", None)
-        self.eps = getattr(original, "eps", 1e-6)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape
-        if x.dim() > 2:
-            x_2d = x.reshape(-1, x.shape[-1])
-        else:
-            x_2d = x
-
-        if self.weight is not None:
-            try:
-                out = self.kernel_fn(x_2d, self.weight, self.eps)
-            except TypeError:
-                out = self.kernel_fn(x_2d, self.weight)
-        else:
-            out = self.kernel_fn(x_2d)
-
-        if len(orig_shape) > 2:
-            out = out.reshape(orig_shape)
-
-        return out
-
-
 class OptimizedModelContext:
     """
     Context manager that patches a model's submodules to use optimized Triton kernels.
@@ -544,13 +475,9 @@ class OptimizedModelContext:
 
         if repl.kernel_type == "matmul":
             count = self._replace_linear_modules(repl)
-        elif repl.kernel_type == "layernorm":
-            count = self._replace_layernorm_modules(repl)
-        elif repl.kernel_type == "rmsnorm":
-            count = self._replace_rmsnorm_modules(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm)")
+                  f"Skipping. (Supported: matmul)")
 
         return count
 
@@ -564,52 +491,6 @@ class OptimizedModelContext:
                 # Create wrapper
                 wrapper = _LinearWrapper(module, repl.module_fn)
                 # Install wrapper
-                parts = name.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], wrapper)
-                count += 1
-        return count
-
-    def _replace_layernorm_modules(self, repl: KernelReplacement) -> int:
-        """Replace all nn.LayerNorm modules with optimized wrapper."""
-        count = 0
-        for name, module in list(self.model.named_modules()):
-            if isinstance(module, nn.LayerNorm):
-                self._original_modules[name] = module
-                wrapper = _LayerNormWrapper(module, repl.module_fn)
-                parts = name.split(".")
-                parent = self.model
-                for p in parts[:-1]:
-                    parent = getattr(parent, p)
-                setattr(parent, parts[-1], wrapper)
-                count += 1
-        return count
-
-    def _replace_rmsnorm_modules(self, repl: KernelReplacement) -> int:
-        """
-        Replace RMSNorm modules. Since there is no standard nn.RMSNorm,
-        we look for common class names and attributes.
-        """
-        count = 0
-        rmsnorm_names = {"RMSNorm", "LlamaRMSNorm", "T5LayerNorm", "GemmaRMSNorm"}
-
-        for name, module in list(self.model.named_modules()):
-            cls_name = type(module).__name__
-            # Match by class name or by having 'weight' but no 'bias' and a norm-like name
-            is_rmsnorm = (
-                cls_name in rmsnorm_names
-                or (hasattr(module, "weight")
-                    and hasattr(module, "eps")
-                    and not hasattr(module, "bias")
-                    and cls_name.lower().endswith("norm")
-                    and not isinstance(module, nn.LayerNorm))
-            )
-
-            if is_rmsnorm:
-                self._original_modules[name] = module
-                wrapper = _RMSNormWrapper(module, repl.module_fn)
                 parts = name.split(".")
                 parent = self.model
                 for p in parts[:-1]:

@@ -37,14 +37,6 @@ OPTIMIZATION_PLAN_PATH = os.path.join(WORKSPACE_DIR, "optimization_plan.json")
 
 SHAPE_KEYS: Dict[str, List[str]] = {
     "matmul":            ["M", "N", "K"],
-    "flash_attention":   ["B", "H", "N", "D"],
-    "layernorm":         ["M", "N"],
-    "softmax":           ["M", "N"],
-    "cross_entropy":     ["batch", "vocab"],
-    "fused_mlp":         ["M", "N", "K"],
-    "rmsnorm":           ["M", "N"],
-    "reduce":            ["M", "N"],
-    "rotary_embedding":  ["B", "H", "N", "D"],
     "conv1d":            ["batch", "in_channels", "length", "out_channels", "kernel_size", "stride"],
     "conv_transpose1d":  ["batch", "in_channels", "length", "out_channels", "kernel_size", "stride"],
     "snake_activation":  ["batch", "channels", "length"],
@@ -54,34 +46,6 @@ SHAPE_KEYS: Dict[str, List[str]] = {
 # Map from alias -> canonical bench.py key, per op_type.
 SHAPE_ALIAS_MAP: Dict[str, Dict[str, str]] = {
     "matmul": {},
-    "flash_attention": {
-        "B": "batch", "H": "heads", "N": "seq_len", "S": "seq_len", "D": "head_dim",
-        "batch": "batch", "heads": "heads", "seq_len": "seq_len", "head_dim": "head_dim",
-    },
-    "layernorm": {
-        "M": "batch", "N": "dim", "rows": "batch", "cols": "dim",
-        "batch": "batch", "dim": "dim",
-    },
-    "softmax": {
-        "M": "rows", "N": "cols", "rows": "rows", "cols": "cols",
-    },
-    "cross_entropy": {
-        "batch": "batch", "vocab": "vocab",
-    },
-    "fused_mlp": {
-        "M": "batch", "N": "hidden", "K": "dim",
-        "batch": "batch", "dim": "dim", "hidden": "hidden",
-    },
-    "rmsnorm": {
-        "M": "M", "N": "N",
-    },
-    "reduce": {
-        "M": "M", "N": "N",
-    },
-    "rotary_embedding": {
-        "B": "batch", "H": "heads", "N": "seq_len", "S": "seq_len", "D": "head_dim",
-        "batch": "batch", "heads": "heads", "seq_len": "seq_len", "head_dim": "head_dim",
-    },
     "conv1d": {
         "batch": "batch", "in_channels": "in_channels", "length": "length",
         "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride",
@@ -107,44 +71,6 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
         "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
         "float32":  {"atol": 1e-4, "rtol": 1e-4},
     },
-    "flash_attention": {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
-        "float32":  {"atol": 1e-4, "rtol": 1e-4},
-    },
-    "layernorm": {
-        "float16":  {"atol": 1e-3, "rtol": 1e-3},
-        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
-        "float32":  {"atol": 1e-5, "rtol": 1e-5},
-    },
-    "softmax": {
-        "float16":  {"atol": 1e-3, "rtol": 1e-3},
-        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
-        "float32":  {"atol": 1e-5, "rtol": 1e-5},
-    },
-    "cross_entropy": {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
-        "float32":  {"atol": 1e-5, "rtol": 1e-5},
-    },
-    "fused_mlp": {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
-        "float32":  {"atol": 1e-4, "rtol": 1e-4},
-    },
-    "rmsnorm": {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 1e-1, "rtol": 5e-2},
-    },
-    "reduce": {
-        "float16":  {"atol": 1e-2, "rtol": 1e-2},
-        "bfloat16": {"atol": 1e-1, "rtol": 5e-2},
-    },
-    "rotary_embedding": {
-        "float16":  {"atol": 1e-3, "rtol": 1e-3},
-        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
-        "float32":  {"atol": 1e-5, "rtol": 1e-5},
-    },
     "conv1d": {
         "float16":  {"atol": 1e-2, "rtol": 1e-2},
         "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
@@ -165,14 +91,6 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
 # FLOPS formulas as source strings, per op_type
 FLOPS_FN_SRC: Dict[str, str] = {
     "matmul":           'return 2 * s["M"] * s["N"] * s["K"]',
-    "flash_attention":  'return 4 * s["batch"] * s["heads"] * (s["seq_len"] ** 2) * s["head_dim"]',
-    "layernorm":        'return 8 * s["batch"] * s["dim"]',
-    "softmax":          'return 5 * s["rows"] * s["cols"]',
-    "cross_entropy":    'return 4 * s["batch"] * s["vocab"]',
-    "fused_mlp":        'return 2 * s["batch"] * s["dim"] * s["hidden"] * 3',
-    "rmsnorm":          'return 6 * s["M"] * s["N"]',
-    "reduce":           'return s["M"] * s["N"]',
-    "rotary_embedding": 'return 6 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"]',
     "conv1d":           'return 2 * s["batch"] * s["out_channels"] * s["length"] * s["in_channels"] * s["kernel_size"] // s["stride"]',
     "conv_transpose1d": 'return 2 * s["batch"] * s["in_channels"] * s["length"] * s["out_channels"] * s["kernel_size"]',
     "snake_activation": 'return 6 * s["batch"] * s["channels"] * s["length"]',
@@ -181,14 +99,6 @@ FLOPS_FN_SRC: Dict[str, str] = {
 # BYTES formulas as source strings, per op_type (dt_bytes is passed in)
 BYTES_FN_SRC: Dict[str, str] = {
     "matmul":           'return (s["M"] * s["K"] + s["K"] * s["N"] + s["M"] * s["N"]) * dt_bytes',
-    "flash_attention":  'return 4 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * dt_bytes',
-    "layernorm":        'return (2 * s["batch"] * s["dim"] + 2 * s["dim"]) * dt_bytes',
-    "softmax":          'return 2 * s["rows"] * s["cols"] * dt_bytes',
-    "cross_entropy":    'return (s["batch"] * s["vocab"] + s["batch"]) * dt_bytes',
-    "fused_mlp":        'return (s["batch"] * s["dim"] + s["hidden"] * s["dim"] * 3 + s["batch"] * s["dim"]) * dt_bytes',
-    "rmsnorm":          'return (2 * s["M"] * s["N"] + s["N"]) * dt_bytes',
-    "reduce":           'return (s["M"] * s["N"] + s["M"]) * dt_bytes',
-    "rotary_embedding": 'return (s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * 2 + s["seq_len"] * s["head_dim"]) * dt_bytes',
     "conv1d":           'return (s["batch"] * s["in_channels"] * s["length"] + s["out_channels"] * s["in_channels"] * s["kernel_size"] + s["batch"] * s["out_channels"] * s["length"] // s["stride"]) * dt_bytes',
     "conv_transpose1d": 'return (s["batch"] * s["in_channels"] * s["length"] + s["in_channels"] * s["out_channels"] * s["kernel_size"] + s["batch"] * s["out_channels"] * s["length"] * s["stride"]) * dt_bytes',
     "snake_activation": 'return (2 * s["batch"] * s["channels"] * s["length"] + s["channels"]) * dt_bytes',
@@ -197,14 +107,6 @@ BYTES_FN_SRC: Dict[str, str] = {
 # Speedup potential heuristic per op_type
 SPEEDUP_ESTIMATES: Dict[str, str] = {
     "matmul":           "2-3x",
-    "flash_attention":  "2-4x",
-    "layernorm":        "1.5-3x",
-    "softmax":          "1.5-3x",
-    "cross_entropy":    "1.5-2x",
-    "fused_mlp":        "2-3x",
-    "rmsnorm":          "1.5-3x",
-    "reduce":           "1.5-2x",
-    "rotary_embedding": "1.5-2x",
     "conv1d":           "2-3x",
     "conv_transpose1d": "2-3x",
     "snake_activation": "2-4x",
@@ -268,15 +170,7 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
     Based on the 'large' size from bench.py KERNEL_CONFIGS.
     """
     defaults: Dict[str, Dict[str, int]] = {
-        "matmul":           {"M": 2048, "N": 2048, "K": 2048},
-        "flash_attention":  {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 64},
-        "layernorm":        {"batch": 4096, "dim": 2048},
-        "softmax":          {"rows": 4096, "cols": 4096},
-        "cross_entropy":    {"batch": 4096, "vocab": 32000},
-        "fused_mlp":        {"batch": 2048, "dim": 2048, "hidden": 5504},
-        "rmsnorm":          {"M": 4096, "N": 4096},
-        "reduce":           {"M": 4096, "N": 4096},
-        "rotary_embedding": {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 128},
+        "matmul":            {"M": 2048, "N": 2048, "K": 2048},
         "conv1d":            {"batch": 1, "in_channels": 256, "length": 2048, "out_channels": 512, "kernel_size": 7, "stride": 1},
         "conv_transpose1d":  {"batch": 1, "in_channels": 512, "length": 256, "out_channels": 256, "kernel_size": 16, "stride": 8},
         "snake_activation":  {"batch": 1, "channels": 512, "length": 1024},
@@ -652,7 +546,7 @@ def main() -> None:
         "--kernel-type",
         type=str,
         default=None,
-        help="Extract only kernels of this type (e.g., matmul, flash_attention)",
+        help="Extract only kernels of this type (e.g., matmul, conv1d, snake_activation)",
     )
 
     args = parser.parse_args()

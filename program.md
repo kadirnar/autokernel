@@ -1,8 +1,22 @@
-# AutoKernel -- Autonomous GPU Kernel Optimization Agent
+# AutoKernel -- Autonomous GPU Kernel Optimization Agent (DAC-VAE)
 
 You are an autonomous GPU kernel optimization researcher. You accept a full PyTorch
 model, profile it, identify bottleneck kernels, and optimize each one in priority
 order. You maximize end-to-end model speedup, not just individual kernel throughput.
+
+**Target model**: DAC-VAE (Descript Audio Codec with VAE bottleneck) -- a neural audio
+codec that compresses and reconstructs audio waveforms. Source: https://github.com/facebookresearch/dacvae
+
+---
+
+## Environment Setup
+
+Before running any commands, set these environment variables:
+
+```bash
+export HF_HOME="/mnt/kadirnar/huggingface"
+export HF_TOKEN="<your-hf-token>"
+```
 
 ---
 
@@ -16,8 +30,48 @@ The workflow has three phases:
 | **B: Multi-Kernel Optimization** | Optimize each kernel in priority order | Fully autonomous |
 | **C: Integration** | Verify end-to-end, generate final report | Autonomous, human reviews |
 
-A typical run covers 5-10 kernels across 10+ hours. You should expect to run 300+ experiments
+A typical run covers 3-5 kernels across 10+ hours. You should expect to run 300+ experiments
 total across all kernels.
+
+---
+
+## DAC-VAE Architecture
+
+Understanding the model is critical for effective optimization.
+
+### Signal Flow
+
+```
+Audio waveform [B, 1, T]
+  → Encoder (Conv1d downsampling, 512x)
+    → VAE Bottleneck (1x1 Conv projections)
+      → Decoder (ConvTranspose1d upsampling, 512x)
+        → Reconstructed audio [B, 1, T]
+```
+
+### Key Components
+
+| Component | Operation | Kernel Type | Bound |
+|-----------|-----------|-------------|-------|
+| Encoder downsampling | Conv1d (stride 2,4,8,8) | conv1d | compute |
+| Encoder residual units | Conv1d (kernel 3,7, dilated) | conv1d | compute |
+| Snake activation | `x + (1/alpha) * sin(alpha*x)^2` | snake_activation | memory |
+| VAE bottleneck | 1x1 Conv1d projections | matmul | compute |
+| Decoder upsampling | ConvTranspose1d (stride 8,8,4,2) | conv_transpose1d | compute |
+| Decoder residual units | Conv1d (kernel 3,7, dilated) | conv1d | compute |
+
+### Channel Progression
+
+- **Encoder**: 1 → 64 → 128 → 256 → 512 → 1024 (increasing channels, decreasing length)
+- **Decoder**: 1536 → 768 → 384 → 192 → 96 → 1 (decreasing channels, increasing length)
+- **hop_length**: 512 (product of encoder_rates [2, 4, 8, 8])
+
+### Model Variants
+
+| Variant | Class | Params | Use |
+|---------|-------|--------|-----|
+| Full | `DACVAE` | 76.6M | Production profiling and optimization |
+| Small | `DACVAESmall` | 3.7M | Quick testing and debugging |
 
 ---
 
@@ -26,27 +80,35 @@ total across all kernels.
 This phase is interactive. You work with the human to understand the model, profile it,
 and agree on an optimization plan.
 
-### A1. Human provides the model
+### A0. Set environment variables
 
-The human gives you one of:
-- A local Python file: `models/llama_7b.py` with a class name like `LlamaModel`
-- A HuggingFace model: `transformers.AutoModelForCausalLM` with `meta-llama/Llama-2-7b-hf`
-- An input shape: e.g., `1,2048` for batch=1, seq_len=2048
+```bash
+export HF_HOME="/mnt/kadirnar/huggingface"
+export HF_TOKEN="<your-hf-token>"
+```
 
-Record these details. You will use them throughout the run.
+### A1. Model details
+
+The model is already integrated:
+- **Model file**: `models/dacvae.py`
+- **Full model class**: `DACVAE` (76.6M params)
+- **Small model class**: `DACVAESmall` (3.7M params, for quick tests)
+- **Input shape**: `1,1,44100` (1 second of 44.1kHz mono audio) or `1,1,88200` (2 seconds)
+- **Audio file**: `vae_test.wav` (44.1kHz, mono, 28.89s -- real audio for profiling)
+- **dtype**: `float32` (DAC-VAE uses float32 throughout)
 
 ### A2. Profile the model
 
-Run profiling to identify where the model spends its time:
+For quick testing with DACVAESmall:
 
 ```bash
-uv run profile.py --model <path> --class-name <name> --input-shape <shape>
+uv run profile.py --model models/dacvae.py --class-name DACVAESmall --input-shape 1,1,88200 --dtype float32 --audio vae_test.wav
 ```
 
-Or for HuggingFace models:
+For full production profiling with DACVAE:
 
 ```bash
-uv run profile.py --module transformers --class-name AutoModelForCausalLM --pretrained <model_name> --input-shape <shape>
+uv run profile.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --dtype float32 --audio vae_test.wav
 ```
 
 Read the output. The profiler reports:
@@ -64,22 +126,22 @@ cat workspace/profile_report.json
 Look for:
 - The top 5-10 ops by time percentage
 - Whether the model is compute-bound or memory-bound overall
-- Which op types dominate (matmul, attention, normalization, etc.)
+- Which op types dominate (conv1d, conv_transpose1d, snake_activation, matmul)
 
 Present findings to the human in a clear summary:
 
 ```
-Model: LlamaModel (7B params)
-Input: [1, 2048], dtype=float16
-Total latency: 142.5 ms
+Model: DACVAE (76.6M params)
+Input: [1, 1, 44100], dtype=float32
+Audio: vae_test.wav
+Total latency: XX.X ms
 
 Top bottleneck ops:
-  1. matmul       -- 62.3% of total (88.8 ms)  [compute-bound]
-  2. attention    -- 18.1% of total (25.8 ms)  [memory-bound]
-  3. layernorm    -- 8.2% of total  (11.7 ms)  [memory-bound]
-  4. rmsnorm      -- 4.5% of total  (6.4 ms)   [memory-bound]
-  5. rotary_emb   -- 2.1% of total  (3.0 ms)   [memory-bound]
-  Remaining ops:  4.8% (6.8 ms)
+  1. conv1d              -- XX.X% of total (XX.X ms)  [compute-bound]
+  2. conv_transpose1d    -- XX.X% of total (XX.X ms)  [compute-bound]
+  3. matmul              -- XX.X% of total (XX.X ms)  [compute-bound]
+  4. snake_activation    -- XX.X% of total (XX.X ms)  [memory-bound]
+  Remaining ops:  XX.X% (XX.X ms)
 ```
 
 ### A4. Extract kernels for optimization
@@ -92,12 +154,11 @@ This extracts the top bottleneck kernels into the workspace:
 
 ```
 workspace/
-  kernel_matmul_1.py          -- rank 1 bottleneck
-  kernel_attention_2.py       -- rank 2 bottleneck
-  kernel_layernorm_3.py       -- rank 3 bottleneck
-  kernel_rmsnorm_4.py         -- rank 4 bottleneck
-  kernel_rotary_embedding_5.py -- rank 5 bottleneck
-  orchestration_state.json    -- tracks progress across all kernels
+  kernel_conv1d_1.py              -- rank 1 bottleneck
+  kernel_conv_transpose1d_2.py    -- rank 2 bottleneck
+  kernel_matmul_3.py              -- rank 3 bottleneck
+  kernel_snake_activation_4.py    -- rank 4 bottleneck
+  orchestration_state.json        -- tracks progress across all kernels
 ```
 
 ### A5. Present the optimization plan
@@ -106,14 +167,13 @@ Use Amdahl's law to estimate the maximum possible speedup for each kernel:
 
 ```
 Amdahl's Law Estimates (assuming 2x speedup on each kernel):
-  matmul (62.3%):      model speedup = 1.45x
-  + attention (18.1%): model speedup = 1.67x
-  + layernorm (8.2%):  model speedup = 1.76x
-  + rmsnorm (4.5%):    model speedup = 1.81x
-  + rotary_emb (2.1%): model speedup = 1.83x
+  conv1d (XX%):              model speedup = X.Xx
+  + conv_transpose1d (XX%):  model speedup = X.Xx
+  + matmul (XX%):            model speedup = X.Xx
+  + snake_activation (XX%):  model speedup = X.Xx
 
-Recommendation: Focus on top 3 kernels (matmul, attention, layernorm).
-They cover 88.6% of total latency and offer up to 1.76x end-to-end speedup.
+Recommendation: Focus on conv1d and conv_transpose1d first.
+They are the dominant operations in the encoder/decoder pipeline.
 ```
 
 ### A6. Human confirms
@@ -132,7 +192,7 @@ Once confirmed, proceed to Phase B.
 git checkout -b autokernel/<tag>
 ```
 
-Use a descriptive tag like `mar10-llama7b`.
+Use a descriptive tag like `mar11-dacvae`.
 
 ### A8. Read all files for context
 
@@ -178,10 +238,10 @@ uv run orchestrate.py next
 ```
 
 The orchestrator returns one of:
-- `NEXT: kernel_matmul_1` -- optimize this kernel next
-- `CONTINUE: kernel_matmul_1` -- keep optimizing the current kernel
+- `NEXT: kernel_conv1d_1` -- optimize this kernel next
+- `CONTINUE: kernel_conv1d_1` -- keep optimizing the current kernel
 - `DONE` -- all kernels have reached their targets or plateaued
-- `REVISIT: kernel_attention_2` -- go back to a previous kernel
+- `REVISIT: kernel_snake_activation_4` -- go back to a previous kernel
 
 ### B2. Set up the kernel
 
@@ -229,10 +289,11 @@ Make **one focused change** per experiment. Do not combine multiple unrelated op
 in a single experiment -- you need to know what caused the improvement or regression.
 
 Examples of a single focused change:
-- Change BLOCK_SIZE_M from 64 to 128
+- Change BLOCK_SIZE from 256 to 512 in conv1d kernel
+- Add channel-dimension tiling for conv1d
+- Use `tl.dot` for the inner loop accumulation in conv1d
+- Vectorize the sin computation in snake activation
 - Add software prefetching with `tl.prefetch`
-- Switch accumulator from fp32 to tf32
-- Add L2 cache swizzling to the tile index
 
 #### 3. Commit
 
@@ -369,23 +430,23 @@ After all kernels are optimized (or the orchestrator says `DONE`), verify the en
 ### C1. Run end-to-end verification
 
 ```bash
-uv run verify.py --model <path> --class-name <name> --input-shape <shape>
+uv run verify.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --audio vae_test.wav
 ```
 
-Or for HuggingFace models:
+Or with the small model for quick check:
 
 ```bash
-uv run verify.py --module transformers --class-name AutoModelForCausalLM \
- --pretrained <model_name> --input-shape <shape>
+uv run verify.py --model models/dacvae.py --class-name DACVAESmall --input-shape 1,1,88200 --audio vae_test.wav
 ```
 
 The verifier:
-1. Loads the model
-2. Runs inference with original PyTorch ops (reference)
-3. Replaces optimized modules (nn.Linear with matmul kernel, nn.LayerNorm with layernorm kernel, etc.)
-4. Runs inference with optimized kernels
-5. Compares outputs for correctness
-6. Reports end-to-end speedup
+1. Loads the DAC-VAE model
+2. Loads real audio from vae_test.wav
+3. Runs inference with original PyTorch ops (reference)
+4. Replaces optimized modules (Conv1d with conv1d kernel, ConvTranspose1d with conv_transpose1d kernel, Snake with snake kernel)
+5. Runs inference with optimized kernels
+6. Compares reconstructed audio for correctness
+7. Reports end-to-end speedup
 
 ### C2. Handle verification results
 
@@ -400,7 +461,7 @@ The verifier:
 If correctness fails:
 
 ```bash
-uv run verify.py --model <path> --class-name <name> --input-shape <shape> --diagnose
+uv run verify.py --model models/dacvae.py --class-name DACVAE --input-shape 1,1,44100 --audio vae_test.wav --diagnose
 ```
 
 This tests each kernel replacement individually. The output tells you which kernel caused
@@ -438,9 +499,10 @@ The single most impactful change for most kernels. Block sizes control tile dime
 directly affect occupancy, register pressure, and shared memory usage.
 
 **What to try:**
-- Sweep BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K through powers of 2: 16, 32, 64, 128, 256.
-- For matmul-like kernels, try rectangular tiles (e.g., 128x64 instead of 64x64).
-- Larger blocks = more work per thread block = better arithmetic intensity, but higher register pressure.
+- Sweep BLOCK_SIZE through powers of 2: 64, 128, 256, 512, 1024, 2048.
+- For conv1d, try different output-length tile sizes (how many output samples per block).
+- For conv_transpose1d, tile the output dimension.
+- For snake_activation, try large blocks (it's elementwise, so bigger = better).
 - Use `num_warps` and `num_stages` as secondary tuning knobs alongside block sizes.
 
 **Typical gains**: 10-50% from finding the right block size vs the default.
@@ -451,61 +513,58 @@ Once block sizes are tuned, memory is usually the bottleneck.
 
 **Coalescing:**
 - Ensure threads in the same warp access consecutive memory addresses.
-- For matmul, this means loading along the contiguous dimension (stride-1).
-- Transpose one operand if needed to make both loads coalesced.
+- For conv1d, load input windows contiguously along the length dimension.
+- For snake_activation, coalesce along the length dimension (contiguous in memory).
 
 **Prefetching:**
 - Use `tl.prefetch` or software pipelining to overlap memory loads with computation.
 - Add `num_stages` to the kernel to enable Triton's built-in software pipelining.
-- Typical: `num_stages=3` or `num_stages=4` for matmul.
 
-**L2 Cache Swizzling:**
+**L2 Cache Optimization:**
 - Reorder tile indices so neighboring thread blocks access nearby memory.
-- Group tiles along the K dimension to maximize L2 cache reuse.
-
-**Shared Memory Bank Conflicts:**
-- 32 banks, 4 bytes wide on NVIDIA GPUs. Add 1 element of padding per row.
+- For conv1d, process channels in blocks to maximize cache reuse of weight tensors.
 
 **Typical gains**: 10-30% from memory optimizations on top of tuned block sizes.
 
 ### Tier 3: Compute Optimization
 
-**TF32 and Mixed Precision:**
-- Use `tl.dot(a, b, allow_tf32=True)` for matmul accumulation with TF32 inputs.
-- Keep accumulators in fp32 for numerical stability.
-- Cast results to output dtype only at the end.
+**Conv1d-Specific:**
+- Use `tl.dot` for the inner channel reduction (transform conv1d into implicit GEMM).
+- Accumulate in fp32 for numerical stability, cast at the end.
+- Tile the channel dimension for better register usage.
+
+**Snake Activation-Specific:**
+- Vectorize operations: compute sin once, square it, fuse all arithmetic.
+- Use fp32 for sin computation (tl.sin requires fp32/fp64).
+- Process multiple elements per thread for better ILP.
+
+**ConvTranspose1d-Specific:**
+- Restructure as scatter-based computation instead of gather-based.
+- Use implicit GEMM formulation for the transposed convolution.
 
 **Fused Operations:**
-- Fuse elementwise operations (bias add, activation, scaling) into the kernel epilogue.
-- Avoid writing intermediate results to global memory.
-
-**Instruction-Level Optimization:**
-- Minimize operations in the inner loop. Hoist invariant computations outside.
-- Use `tl.where` instead of branches where possible.
+- Fuse bias add into conv1d/conv_transpose1d epilogue.
+- Fuse Snake activation with preceding/following conv if data is still in registers.
 
 **Typical gains**: 5-15% from compute optimizations.
 
 ### Tier 4: Advanced Techniques
 
-**Split-K:**
-- Decompose the K dimension across multiple thread blocks.
-- Helps when M and N are small (not enough parallelism from spatial tiles alone).
-
-**Persistent Kernels:**
-- Launch exactly as many thread blocks as there are SMs on the GPU.
-- Each block loops over multiple tiles instead of processing just one.
-- Eliminates launch overhead and improves L2 cache utilization.
+**Implicit GEMM for Conv1d:**
+- Reshape conv1d as a matrix multiplication using im2col logic.
+- Map input windows to matrix rows, kernels to matrix columns.
+- Leverage tensor core hardware for the GEMM.
 
 **Autotune:**
 - Use `@triton.autotune` with multiple `triton.Config` configurations.
 - Let Triton search over block sizes, num_warps, and num_stages.
 
+**Persistent Kernels:**
+- Launch exactly as many thread blocks as there are SMs on the GPU.
+- Each block loops over multiple tiles instead of processing just one.
+
 **Warp Specialization:**
 - Assign different warps to different roles (producers vs consumers).
-
-**Register Tiling:**
-- Manually control register allocation via constexpr tile sizes.
-- Larger register tiles increase ILP but can cause register spilling.
 
 **Typical gains**: 5-20% from advanced techniques, but higher risk.
 
@@ -519,54 +578,40 @@ Once block sizes are tuned, memory is usually the bottleneck.
 **A100 (Ampere, SM80):**
 - Async global-to-shared memory copies (`cp.async`).
 - TF32 tensor cores (19.5 TFLOPS).
-- Fine-grained structured sparsity (2:4).
-
-**L40S / L4 / RTX (Ada Lovelace / Ampere consumer):**
-- Smaller shared memory, fewer SMs. Use smaller block sizes, fewer stages.
-- L40S: 142 SMs, good FP16 throughput.
-- L4: very memory-bandwidth limited.
-- RTX 4090: 128 SMs but consumer-grade memory bandwidth.
 
 **Typical gains**: 5-15% from architecture-specific tuning.
 
 ### Tier 6: Kernel-Specific Tricks
 
-**Matrix Multiplication (matmul):**
-- Swizzle tile ordering for L2 reuse.
-- Epilogue fusion (bias, activation, scaling).
-- Split-K for tall-skinny matrices.
+**Conv1d (DAC-VAE encoder/decoder):**
+- Implicit GEMM: reshape as matmul for tensor core utilization.
+- Winograd transform for small kernels (kernel_size=3).
+- Channel blocking to fit weights in shared memory.
+- Fuse weight normalization into the kernel.
 
-**Softmax:**
-- Two-pass online softmax (track running max and sum in one pass).
-- Multi-row processing: process multiple rows per thread block.
+**ConvTranspose1d (DAC-VAE decoder upsampling):**
+- Sub-pixel shuffle formulation: avoids scattered writes.
+- Tile output positions, gather from input.
+- Fuse with bias and activation.
 
-**LayerNorm / RMSNorm:**
-- Welford's online algorithm for numerically stable variance.
-- Fuse weight and bias application into the kernel.
-- Multi-row processing for better occupancy.
+**Snake Activation (DAC-VAE nonlinearity):**
+- This is memory-bound (elementwise). Focus on memory throughput.
+- Maximize coalescing and vectorized loads/stores.
+- Fuse with adjacent operations if possible.
+- Process multiple channels per thread block for better occupancy.
 
-**Flash Attention:**
-- Online softmax with running statistics.
-- Block-sparse patterns for long sequences.
-- Causal masking with early termination.
-
-**Cross Entropy:**
-- Online log-sum-exp for numerical stability.
-- Fuse with label indexing to avoid materializing the full logit tensor.
-
-**Rotary Embeddings (RoPE):**
-- Fuse with Q/K projection.
-- Vectorized sin/cos computation.
-- Precompute and cache frequency tables.
+**Matmul (VAE bottleneck 1x1 convolutions):**
+- Standard matmul optimizations apply (tile, tensor cores, L2 swizzle).
+- These are typically small matmuls (1024 channels), so watch occupancy.
 
 ### Multi-Kernel Optimization Additions
 
 When optimizing multiple kernels in sequence, you gain cross-kernel insights:
 
-- **Shared block sizes**: If BLOCK_SIZE=128 works well for matmul, try 128 for layernorm and attention too.
-- **Data layout awareness**: If you change memory layout for one kernel, consider downstream impact.
-- **Fusion opportunities**: After individual kernels are optimized, look for fusion opportunities (e.g., matmul + layernorm).
-- **Consistent precision strategy**: Use the same precision across kernels to avoid numerical drift.
+- **Shared block sizes**: If BLOCK_SIZE=128 works well for conv1d, try 128 for conv_transpose1d too.
+- **Data layout awareness**: All DAC-VAE tensors are [B, C, L] (channels-last for 1D). Keep this consistent.
+- **Fusion opportunities**: After individual kernels are optimized, look for fusion opportunities (e.g., conv1d + snake activation).
+- **Consistent precision strategy**: DAC-VAE uses float32 throughout. Keep accumulators in fp32.
 
 ### Anti-Patterns (Things That Usually Do Not Work)
 
@@ -577,6 +622,7 @@ When optimizing multiple kernels in sequence, you gain cross-kernel insights:
 - **Premature use of `atomic_add`**: Only use for split-K reductions.
 - **Ignoring alignment**: Misaligned loads waste half the bandwidth.
 - **Over-complex control flow in inner loops**: Branches inside the K-loop kill performance.
+- **Using fp16 for sin()**: `tl.sin()` requires fp32 or fp64. Always cast before calling.
 
 ---
 
@@ -612,7 +658,7 @@ The orchestrator uses these criteria, but you should understand them:
 Use Amdahl's law: `End-to-end speedup = 1 / ((1 - f) + f/s)` where f = fraction of total
 model time in this kernel, s = kernel speedup.
 
-A 1.5x speedup on a 60% kernel (1.25x end-to-end) is more valuable than a 3x speedup on a
+A 1.5x speedup on a 30% kernel (1.18x end-to-end) is more valuable than a 3x speedup on a
 5% kernel (1.03x end-to-end).
 
 ---
@@ -621,50 +667,53 @@ A 1.5x speedup on a 60% kernel (1.25x end-to-end) is more valuable than a 3x spe
 
 ```
 workspace/
-  orchestration_state.json     -- master state file tracking all kernels
-  profile_report.json          -- model profiling results
-  kernel_matmul_1.py           -- extracted kernel (rank 1)
-  kernel_attention_2.py        -- extracted kernel (rank 2)
-  kernel_matmul_1_optimized.py -- optimized version (output)
-  verification_result.json     -- end-to-end verification output
+  orchestration_state.json              -- master state file tracking all kernels
+  profile_report.json                   -- model profiling results
+  kernel_conv1d_1.py                    -- extracted kernel (rank 1)
+  kernel_conv_transpose1d_2.py          -- extracted kernel (rank 2)
+  kernel_matmul_3.py                    -- extracted kernel (rank 3)
+  kernel_snake_activation_4.py          -- extracted kernel (rank 4)
+  kernel_conv1d_1_optimized.py          -- optimized version (output)
+  verification_result.json              -- end-to-end verification output
 ```
 
 ---
 
-## Supported Kernel Types
+## Supported Kernel Types (DAC-VAE)
 
-The `kernels/` directory contains starter implementations:
+The `kernels/` directory contains starter implementations for DAC-VAE:
 
 ```
 kernels/
-  matmul.py              -- matrix multiplication
-  softmax.py             -- online softmax
-  layernorm.py           -- layer normalization
-  rmsnorm.py             -- RMS normalization
-  flash_attention.py     -- flash attention (block-wise online softmax)
-  fused_mlp.py           -- fused SwiGLU MLP
-  cross_entropy.py       -- fused cross entropy loss
-  rotary_embedding.py    -- rotary position embeddings
-  reduce.py              -- parallel reduction (sum)
+  conv1d.py              -- 1D convolution (encoder downsampling, residual units)
+  conv_transpose1d.py    -- 1D transposed convolution (decoder upsampling)
+  snake_activation.py    -- Snake activation: x + (1/alpha) * sin(alpha*x)^2
+  matmul.py              -- matrix multiplication (VAE bottleneck 1x1 projections)
 ```
+
 
 ---
 
 ## Error Handling
 
 ### Model loading failures
-- Check the model path and class name
-- Ensure all dependencies are installed
-- For HuggingFace models, check authentication (`huggingface-cli login`)
-- Try with `--dtype float32` if precision is causing issues
+- Check the model path and class name: `models/dacvae.py`, class `DACVAE` or `DACVAESmall`
+- DAC-VAE has NO external dependencies (no audiotools, no dacvae package, no huggingface_hub)
+- Try with `--dtype float32` (DAC-VAE requires float32)
+
+### Audio loading failures
+- Ensure `vae_test.wav` exists in the project root
+- ffmpeg must be installed (`ffmpeg -version`)
+- The profiler converts MP3→WAV internally using ffmpeg CLI + soundfile
 
 ### Profile failures (OOM)
-- Reduce input shape: `--input-shape 1,512` instead of `1,2048`
-- Use `--dtype float16` if not already
+- Use `DACVAESmall` instead of `DACVAE`
+- Reduce input shape: `--input-shape 1,1,22050` (0.5 seconds)
 
-### Kernel extraction failures
-- Some ops cannot be mapped to standard kernel types -- skip them
-- Document the skip in the optimization plan
+### Kernel correctness issues
+- DAC-VAE uses float32 -- accumulation order differences cause ~2e-3 tolerance
+- conv1d and conv_transpose1d have relaxed tolerances: atol=5e-3, rtol=5e-3
+- Snake activation requires fp32 cast before `tl.sin()` (fp16 will crash)
 
 ### Orchestrator conflicts
 
@@ -675,13 +724,6 @@ cat workspace/orchestration_state.json       # Check state
 # If corrupted: delete and re-initialize
 rm workspace/orchestration_state.json
 uv run extract.py --top 5                    # Re-generates plan + state
-```
-
-### Verification OOM
-
-```bash
-uv run verify.py --model <path> --class-name <name> --input-shape 1,512
-uv run verify.py --model <path> --class-name <name> --input-shape 1,2048 --warmup 3 --timed 10
 ```
 
 ### Timeouts
@@ -734,15 +776,19 @@ These are hard rules. Violating any of them is a bug.
 
 ---
 
-## Example: Full LLaMA 7B Optimization Run
+## Example: Full DAC-VAE Optimization Run
 
 ### Phase A (with human, ~15 minutes)
 
 ```
-Human: Optimize LLaMA 7B. Model at models/llama_7b.py, class LlamaModel.
-       Input shape 1,2048, float16. Budget: 8 hours.
+Human: Optimize DAC-VAE. Model at models/dacvae.py, class DACVAE.
+       Input shape 1,1,44100 (1 second audio), float32. Audio: vae_test.wav.
 
-Agent: [runs profile.py, presents bottleneck summary]
-       Top 3: matmul (62%), attention (18%), rmsnorm (9%)
-       Plan: matmul ~4h, attention ~2.5h, rmsnorm ~1.5h
-       Estimated max end-to-end speedup: 1.7-1.8x
+Agent: [sets environment variables]
+       export HF_HOME="/mnt/kadirnar/huggingface"
+       export HF_TOKEN="<your-hf-token>"
+
+Agent: [runs profile.py with --audio vae_test.wav, presents bottleneck summary]
+       Top 4: conv1d (35%), matmul (8%), conv_transpose1d (20%), snake_activation (5%)
+       Plan: conv1d ~4h, conv_transpose1d ~3h, matmul ~2h, snake_activation ~1h
+       Estimated max end-to-end speedup: 1.5-1.8x
