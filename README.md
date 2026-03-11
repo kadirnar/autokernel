@@ -1,90 +1,174 @@
-# autoresearch
+# AutoKernel
 
-![teaser](progress.png)
+**Autoresearch for GPU kernels.** Give it any PyTorch model, go to sleep, wake up to optimized Triton kernels.
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+Inspired by [@karpathy/autoresearch](https://github.com/karpathy/autoresearch) -- which demonstrated autonomous AI agents for LLM training research. AutoKernel applies the same philosophy to GPU kernel optimization: agent modifies one file, runs a fixed evaluation, keeps or reverts, repeats forever.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
+## How It Works
 
-## How it works
+Give AutoKernel any PyTorch model. It will:
 
-The repo is deliberately kept small and only really has a three files that matter:
+1. **Profile** the model to find which GPU kernels are bottlenecks
+2. **Extract** each bottleneck as a standalone Triton kernel
+3. **Optimize** each kernel autonomously (edit, benchmark, keep/revert -- forever)
+4. **Verify** end-to-end correctness and report the total speedup
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+The agent reads `program.md` -- the "research org code" -- which contains comprehensive instructions for autonomous operation. It edits `kernel.py` one kernel at a time, runs `bench.py` (fixed benchmark with 5-stage correctness checks + roofline analysis), and either keeps or reverts the change. The orchestrator decides when to move to the next kernel using Amdahl's law.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+Each experiment takes ~90 seconds. That's ~40 experiments/hour, ~320 overnight, across all kernels.
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+## Quick Start
 
-## Quick start
-
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** NVIDIA GPU (tested on H100/A100/RTX 4090), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
-
-# 1. Install uv project manager (if you don't already have it)
+# Install uv (if you don't have it)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Install dependencies
+# Clone and setup
+git clone https://github.com/RightNow-AI/autokernel.git
+cd autokernel
 uv sync
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
+# One-time setup: test data + baselines
 uv run prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# Profile a model (ships with GPT-2, LLaMA, BERT -- no transformers needed)
+uv run profile.py --model models/llama_7b.py --class-name LlamaModel \
+ --input-shape 1,512 --dtype float16
+
+# Extract top bottleneck kernels
+uv run extract.py --top 5
+
+# Verify benchmark works
+uv run bench.py
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+## Running the Agent
 
-## Running the agent
-
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Spin up Claude, Codex, or any coding agent in this directory:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+Read program.md and let's kick off a new experiment. Start with setup.
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+The agent will:
+1. Profile your model and present the optimization plan
+2. Create a branch (e.g., `autokernel/mar10-llama7b`)
+3. Optimize each bottleneck kernel in priority order
+4. Verify end-to-end correctness and report total speedup
 
-## Project structure
+`program.md` is intentionally comprehensive so the agent can run 10+ hours without getting stuck. It includes a 6-tier optimization playbook, decision framework, crash handling, and Amdahl's law reasoning.
+
+## The Pipeline
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+                 profile.py              extract.py           bench.py (loop)         verify.py
+Any PyTorch  ──>  Rank kernels  ──>  Generate baseline  ──>  Optimize each  ──>  End-to-end
+   model          by GPU time       Triton kernels          kernel (agent)       verification
 ```
 
-## Design choices
+| Tool | What it does |
+|------|-------------|
+| `profile.py` | Profiles any PyTorch model with `torch.profiler`, ranks kernels by GPU time, classifies as compute/memory-bound |
+| `extract.py` | Extracts top-N bottleneck kernels from profiling results into standalone Triton kernel files |
+| `orchestrate.py` | Multi-kernel scheduler: decides which kernel to optimize next using Amdahl's law, tracks aggregate progress |
+| `bench.py` | Fixed benchmark: 5-stage correctness (smoke, shape sweep, numerical stability, determinism, edge cases) + performance + roofline |
+| `verify.py` | Plugs optimized kernels back into the model, checks end-to-end correctness, reports total speedup |
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+## Supported Kernels
 
-## Platform support
+9 kernel types covering the core operations of modern deep learning:
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+| Kernel | Description | Key Metric |
+|--------|-------------|------------|
+| **matmul** | Dense matrix multiplication (M x K) @ (K x N) | TFLOPS |
+| **softmax** | Row-parallel numerically stable softmax | GB/s |
+| **layernorm** | Layer normalization with affine transform | GB/s |
+| **rmsnorm** | RMS normalization (LLaMA-style) | GB/s |
+| **flash_attention** | Scaled dot-product attention with causal masking | TFLOPS |
+| **fused_mlp** | SwiGLU-style fused MLP (gate + up + down) | TFLOPS |
+| **cross_entropy** | Fused cross entropy loss | GB/s |
+| **rotary_embedding** | Rotary position embeddings (RoPE) | GB/s |
+| **reduce** | Parallel reduction (sum) | GB/s |
 
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
+Each has a PyTorch reference in `reference.py` and a starter Triton kernel in `kernels/`.
 
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
+## Example Models
 
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
+Self-contained model definitions ship with AutoKernel (no `transformers` library needed):
 
-## Notable forks
+| Model | File | Params | Usage |
+|-------|------|--------|-------|
+| GPT-2 Small | `models/gpt2.py` | 124M | `--class-name GPT2 --input-shape 1,1024` |
+| LLaMA (compact) | `models/llama_7b.py` | 160M | `--class-name LlamaModel --input-shape 1,512` |
+| LLaMA 7B | `models/llama_7b.py` | 7B | `--class-name LlamaModel7B --input-shape 1,2048` |
+| BERT-base | `models/bert_base.py` | 110M | `--class-name BertModel --input-shape 8,512` |
+| Custom | `models/custom.py` | -- | Template for your own model |
 
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
+For HuggingFace models (`uv sync --extra models`):
+
+```bash
+uv run profile.py --module transformers --class-name AutoModelForCausalLM \
+ --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048 --dtype float16
+```
+
+## Project Structure
+
+```
+autokernel/
+  kernel.py             the file the agent modifies (one kernel at a time)
+  program.md            agent instructions -- the "research org code"
+
+  bench.py              fixed benchmark + 5-stage correctness harness
+  reference.py          PyTorch reference implementations (ground truth)
+  prepare.py            one-time setup: test data, baselines
+
+  profile.py            profile any PyTorch model, rank kernels by GPU time
+  extract.py            extract bottleneck kernels into workspace/
+  orchestrate.py        multi-kernel scheduler (Amdahl's law)
+  verify.py             end-to-end model verification + speedup report
+  analysis.py           experiment visualization (generates progress.png)
+
+  kernels/              starter Triton kernels (9 types)
+  models/               self-contained model definitions (GPT-2, LLaMA, BERT)
+  workspace/            runtime artifacts (gitignored)
+```
+
+## Design Choices
+
+**Why Triton.** Readable Python-like syntax the agent can understand and modify without mastering inline PTX or SASS. Well-tuned Triton regularly reaches 80-95% of cuBLAS. The agent needs to iterate fast -- Triton compiles in seconds, not minutes.
+
+**Correctness first.** The benchmark checks kernel output against PyTorch before measuring performance. A fast but wrong kernel is immediately reverted. This prevents the agent from "optimizing" by producing garbage.
+
+**Amdahl's law orchestration.** The orchestrator prioritizes by impact. A 1.5x speedup on a 60% kernel (1.25x end-to-end) beats a 3x speedup on a 5% kernel (1.03x end-to-end). It moves on when diminishing returns set in.
+
+**Single file to modify.** The agent only touches `kernel.py`. Scope stays manageable, diffs reviewable, reverts clean.
+
+**TSV logging.** Results go to a plain `results.tsv` file. Human-readable, git-friendly, trivially parseable, no infrastructure.
+
+## Results Format
+
+Every experiment is logged to `results.tsv` (tab-separated):
+
+| Column | Description |
+|--------|-------------|
+| `experiment` | Sequential experiment number (0 = baseline) |
+| `tag` | Short identifier |
+| `kernel_type` | Which kernel (e.g., `matmul`) |
+| `throughput_tflops` | Measured throughput (higher is better) |
+| `latency_us` | Execution time in microseconds |
+| `pct_peak` | Percentage of GPU theoretical peak |
+| `speedup_vs_pytorch` | Speedup vs PyTorch/cuBLAS |
+| `correctness` | PASS, FAIL, TIMEOUT, or CRASH |
+| `peak_vram_mb` | Peak GPU memory usage |
+| `description` | What was tried |
+
+## Credits
+
+This project is **autoresearch for GPU kernels** -- directly inspired by Andrej Karpathy's [autoresearch](https://github.com/karpathy/autoresearch), the original experiment in autonomous AI research agents for LLM training. Karpathy showed that an AI agent can run hundreds of experiments overnight, methodically exploring a search space and logging every result. AutoKernel applies that same loop -- agent edits one file, runs a fixed evaluation, keeps or reverts -- to the domain of GPU kernel optimization with Triton.
+
+Built by the team behind [Forge](https://www.rightnowai.co/forge).
 
 ## License
 
